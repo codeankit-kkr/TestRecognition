@@ -1,0 +1,144 @@
+import functions_framework
+import base64
+from PIL import Image
+from io import BytesIO
+import numpy as np
+from typing import Dict, List, Union
+from google.cloud import aiplatform_v1
+from google.cloud import aiplatform
+from google.protobuf import json_format
+from google.protobuf.struct_pb2 import Value
+
+import json
+
+@functions_framework.http
+def hello_http(request):
+    """HTTP Cloud Function.
+    Args:
+        request (flask.Request): The request object.
+        <https://flask.palletsprojects.com/en/1.1.x/api/#incoming-request-data>
+    Returns:
+        The response JSON object.
+    """
+    print(request)
+    request_json = request.get_json(silent=True)
+    request_args = request.args
+
+    if request_json and 'base64Img' in request_json:
+        base64_img = request_json['base64Img']
+    else:
+        return 'Error: base64Img not found in request', 400
+
+    # Convert base64 string to image
+    try:
+        img_data = base64.b64decode(base64_img)
+        img = Image.open(BytesIO(img_data))
+    except Exception as e:
+        return f'Error decoding base64 image: {str(e)}', 400
+
+    # Log the image dimensions
+    print('Image dimensions:', img.size)
+    image = np.array(img)
+
+    image = image / 255.0 
+    # image = np.expand_dims(image, axis=0)  # Add
+    if image.shape[-1] != 3:
+        # Convert grayscale to RGB
+        image = np.stack((image,) * 3, axis=-1)
+    image = image.tolist()
+
+    instances = {"input_1": image}
+    projectId = "906999370273"
+    endpoint_id = "7394072760281989120"
+    predictions = predict_custom_trained_model_sample(
+        projectId, endpoint_id, instances)
+
+    my_list = []
+    # Iterate over the elements in the repeated field
+    for element in predictions[0]:
+        # Extract the desired information from each element and append it to the list
+        # For example, if the elements are objects with a 'value' field, you can append the values to the list
+        my_list.append(float(element))
+
+    # Now my_list contains the values extracted from the repeated field
+    print(my_list)
+
+    # Set variables for the current deployed index.
+    API_ENDPOINT = "809467803.us-central1-906999370273.vdb.vertexai.goog"
+    INDEX_ENDPOINT = "projects/906999370273/locations/us-central1/indexEndpoints/6767384117798502400"
+    DEPLOYED_INDEX_ID = "dogfacenet_1711701004911"
+
+    # Configure Vector Search client
+    client_options = {
+        "api_endpoint": API_ENDPOINT
+    }
+    vector_search_client = aiplatform_v1.MatchServiceClient(
+        client_options=client_options,
+    )
+
+    # Build FindNeighborsRequest object
+    datapoint = aiplatform_v1.IndexDatapoint(
+        feature_vector=my_list
+    )
+    query = aiplatform_v1.FindNeighborsRequest.Query(
+        datapoint=datapoint,
+        # The number of nearest neighbors to be retrieved
+        neighbor_count=10
+    )
+    request = aiplatform_v1.FindNeighborsRequest(
+        index_endpoint=INDEX_ENDPOINT,
+        deployed_index_id=DEPLOYED_INDEX_ID,
+        # Request can have multiple queries
+        queries=[query],
+        return_full_datapoint=False,
+    )
+
+    # Execute the request
+    response = vector_search_client.find_neighbors(request)
+
+    # Handle the response
+    endTime = time.time()
+    print("Time-Taken :", endTime-startTime)
+    print(response)
+
+    # Return a response
+    response_data = {'message': 'Image received and logged successfully'}
+    return json.dumps(response_data), 200, {'Content-Type': 'application/json'}
+
+
+def predict_custom_trained_model_sample(
+    project: str,
+    endpoint_id: str,
+    instances: Union[Dict, List[Dict]],
+    location: str = "us-central1",
+    api_endpoint: str = "us-central1-aiplatform.googleapis.com",
+):
+    """
+    `instances` can be either single instance of type dict or a list
+    of instances.
+    """
+    # The AI Platform services require regional API endpoints.
+    client_options = {"api_endpoint": api_endpoint}
+    # Initialize client that will be used to create and send requests.
+    # This client only needs to be created once, and can be reused for multiple requests.
+    client = aiplatform.gapic.PredictionServiceClient(
+        client_options=client_options)
+    # The format of each instance should conform to the deployed model's prediction input schema.
+    instances = instances if isinstance(instances, list) else [instances]
+    instances = [
+        json_format.ParseDict(instance_dict, Value()) for instance_dict in instances
+    ]
+    parameters_dict = {}
+    parameters = json_format.ParseDict(parameters_dict, Value())
+    endpoint = client.endpoint_path(
+        project=project, location=location, endpoint=endpoint_id
+    )
+    response = client.predict(
+        endpoint=endpoint, instances=instances, parameters=parameters
+    )
+    print("response")
+    print(" deployed_model_id:", response.deployed_model_id)
+    # The predictions are a google.protobuf.Value representation of the model's predictions.
+    predictions = response.predictions
+    return predictions
+
